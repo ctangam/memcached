@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::{io::Read, time::Instant};
 
 use anyhow::{Error, Result};
 use dashmap::DashMap;
@@ -6,8 +6,12 @@ use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener};
 
 #[derive(Debug, PartialEq)]
 pub enum Req {
-    Set(Set),
+    Set(Common),
     Get(Get),
+    Add(Common),
+    Replace(Common),
+    Append(Common),
+    Prepend(Common),
 }
 
 impl Req {
@@ -17,15 +21,17 @@ impl Req {
         println!("Name: [{}]", name);
 
         match name {
-            "set" => Ok(Req::Set(Set::from(data)?)),
+            "set" => Ok(Req::Set(Common::from(data)?)),
             "get" => Ok(Req::Get(Get::from(data)?)),
+            "add" => Ok(Req::Add(Common::from(data)?)),
+            "replace" => Ok(Req::Replace(Common::from(data)?)),
             _ => Err(Error::msg(format!("Invalid command {}", name))),
         }
     }
 }
 
 #[derive(Debug, PartialEq)]
-pub struct Set {
+pub struct Common {
     pub name: String,
     pub key: String,
     pub flags: u16,
@@ -35,8 +41,8 @@ pub struct Set {
     pub data_block: Vec<u8>,
 }
 
-impl Set {
-    pub fn from(data: &str) -> Result<Set, Error> {
+impl Common {
+    pub fn from(data: &str) -> Result<Common, Error> {
         let parts = data.split(" ").collect::<Vec<&str>>();
         println!("Command: {:?}", parts);
         if parts.len() < 5 {
@@ -54,7 +60,7 @@ impl Set {
         let no_reply = no_reply != "";
         let data_block = data_block.as_bytes()[..byte_count].to_vec();
 
-        Ok(Set {
+        Ok(Common {
             name,
             key,
             flags,
@@ -88,6 +94,7 @@ impl Get {
 
 pub enum Resp {
     Stored,
+    NotStored,
     End,
     Value(Value),
 }
@@ -96,6 +103,7 @@ impl Resp {
     pub fn to_string(&self) -> String {
         match self {
             Resp::Stored => "STORED\r\n".to_string(),
+            Resp::NotStored => "NOT_STORED\r\n".to_string(),
             Resp::End => "END\r\n".to_string(),
             Resp::Value(value) => value.to_string(),
         }
@@ -148,36 +156,55 @@ async fn main() {
                         let command = Req::from(&data).unwrap();
         
                         let resp = match command {
-                            Req::Set(set) => {
-                                let value = Value {
-                                    name: set.key.clone(),
-                                    data_block: set.data_block.clone(),
-                                    flags: set.flags,
-                                    byte_count: set.byte_count,
-                                };
-                                let expires_at = if set.exptime == 0 {
-                                    None
-                                } else {
-                                    Some(Instant::now() + std::time::Duration::from_secs(set.exptime))
-                                };
-                                let entry = Entry {
-                                    data: value.clone(),
-                                    expires_at
-                                };
- 
-                                storage.insert(set.key, entry);
-
-                                if !set.no_reply {
-                                    Some(Resp::Stored)
-                                } else {
-                                    None
-                                }
-                            }
+                            Req::Set(common) => store(&storage, common),
                             Req::Get(get) => {
                                 if let Some(entry) = storage.get(&get.key) {
-                                    Some(Resp::Value(entry.data.clone()))
+                                    if entry.expires_at.is_some_and(|e| e <= Instant::now()) {
+                                        storage.remove(&get.key);
+                                        Some(Resp::End)
+                                    } else {
+                                        Some(Resp::Value(entry.data.clone()))
+                                    }
                                 } else {
                                     Some(Resp::End)
+                                }
+                            },
+                            Req::Add(common) => {
+                                if let None = storage.get(&common.key) {
+                                    store(&storage, common)
+                                } else {
+                                    Some(Resp::NotStored)
+                                }
+                            },
+                            Req::Replace(common) => {
+                                if storage.contains_key(&common.key) {
+                                    store(&storage, common)
+                                } else {
+                                    Some(Resp::NotStored)
+                                }
+                            },
+                            Req::Append(mut common) => {
+                                if let Some(entry) = storage.get(&common.key) {
+                                    let mut bytes = Vec::new();
+                                    bytes.extend_from_slice(&entry.data.data_block);
+                                    bytes.extend_from_slice(&common.data_block);
+                                    common.data_block = bytes;
+
+                                    store(&storage, common)
+                                } else {
+                                    Some(Resp::NotStored)
+                                }
+                            },
+                            Req::Prepend(mut common) => {
+                                if let Some(entry) = storage.get(&common.key) {
+                                    let mut bytes = Vec::new();
+                                    bytes.extend_from_slice(&common.data_block);
+                                    bytes.extend_from_slice(&entry.data.data_block);
+                                    common.data_block = bytes;
+                                    
+                                    store(&storage, common)
+                                } else {
+                                    Some(Resp::NotStored)
                                 }
                             }
                         };
@@ -198,10 +225,36 @@ async fn main() {
     }
 }
 
+fn store(storage: &DashMap<String, Entry>, common: Common) -> Option<Resp> {
+    let value = Value {
+        name: common.key.clone(),
+        data_block: common.data_block.clone(),
+        flags: common.flags,
+        byte_count: common.byte_count,
+    };
+    let expires_at = if common.exptime == 0 {
+        None
+    } else {
+        Some(Instant::now() + std::time::Duration::from_secs(common.exptime))
+    };
+    let entry = Entry {
+        data: value.clone(),
+        expires_at
+    };
+    if common.exptime > 0 {
+        storage.insert(common.key, entry);
+    }
+
+    if !common.no_reply {
+        Some(Resp::Stored)
+    } else {
+        None
+    }
+}
 
 #[test]
 fn test_set() {
-    let command = Set::from("set hello 0 0 5 \r\nhello\r\n").unwrap();
+    let command = Common::from("set hello 0 0 5 \r\nhello\r\n").unwrap();
 
     assert_eq!(command.name, "set");
     assert_eq!(command.key, "hello");
@@ -214,7 +267,7 @@ fn test_set() {
 
 #[test]
 fn test_empty_data_set() {
-    let command = Set::from("set hello 0 0 0 \r\n\r\n").unwrap();
+    let command = Common::from("set hello 0 0 0 \r\n\r\n").unwrap();
 
     assert_eq!(command.name, "set");
     assert_eq!(command.key, "hello");
@@ -228,7 +281,7 @@ fn test_empty_data_set() {
 
 #[test]
 fn test_noreply_set() {
-    let command = Set::from("set hello 0 0 5 noreply\r\nhello\r\n").unwrap();
+    let command = Common::from("set hello 0 0 5 noreply\r\nhello\r\n").unwrap();
 
     assert_eq!(command.name, "set");
     assert_eq!(command.key, "hello");
@@ -241,7 +294,7 @@ fn test_noreply_set() {
 
 #[test]
 fn test_noreply_empty_data_set() {
-    let command = Set::from("set hello 0 0 0 noreply\r\n\r\n").unwrap();
+    let command = Common::from("set hello 0 0 0 noreply\r\n\r\n").unwrap();
 
     assert_eq!(command.name, "set");
     assert_eq!(command.key, "hello");
@@ -264,7 +317,7 @@ fn test_get() {
 fn test_req() {
     let command = Req::from("set hello 0 0 5 \r\nhello\r\n").unwrap();
 
-    assert_eq!(command, Req::Set(Set::from("set hello 0 0 5 \r\nhello\r\n").unwrap()));
+    assert_eq!(command, Req::Set(Common::from("set hello 0 0 5 \r\nhello\r\n").unwrap()));
 
     let command = Req::from("get hello\r\n").unwrap();
 
